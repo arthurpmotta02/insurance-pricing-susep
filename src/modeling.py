@@ -86,25 +86,26 @@ def gini_coefficient(y_true: np.ndarray, y_pred: np.ndarray) -> float:
 def double_lift_chart(y_true: pd.Series, pred_glm: pd.Series,
                        pred_ml: pd.Series, n_bins: int = 10) -> pd.DataFrame:
     """
-    Double lift chart: compara GLM vs ML célula a célula.
-    Razão pred_ml / pred_glm por decil de risco.
-    Valores > 1 indicam onde ML supera GLM.
+    Lift chart por decil de risco.
+    Ordena por pred_ml e calcula lift = obs_mean / mean_global.
     """
     df = pd.DataFrame({
-        'true':    y_true.values,
-        'glm':     pred_glm.values,
-        'ml':      pred_ml.values,
-        'ratio':   pred_ml.values / np.maximum(pred_glm.values, 1e-10)
-    })
-    df['decil'] = pd.qcut(df['glm'], q=n_bins, labels=False, duplicates='drop')
+        'true': y_true.values,
+        'glm':  pred_glm.values,
+        'ml':   pred_ml.values,
+    }).sort_values('ml', ascending=False).reset_index(drop=True)
 
-    result = df.groupby('decil').agg(
+    df['decil'] = pd.cut(df.index, bins=n_bins, labels=range(1, n_bins + 1))
+
+    result = df.groupby('decil', observed=True).agg(
         obs_mean=('true', 'mean'),
-        glm_mean=('glm', 'mean'),
-        ml_mean=('ml',  'mean'),
-        ratio_mean=('ratio', 'mean'),
+        glm_mean=('glm',  'mean'),
+        ml_mean=('ml',   'mean'),
         n=('true', 'count')
     ).reset_index()
+
+    mean_global = df['true'].mean()
+    result['lift'] = result['obs_mean'] / mean_global
 
     return result
 
