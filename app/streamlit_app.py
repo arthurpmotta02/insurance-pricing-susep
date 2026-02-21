@@ -9,6 +9,7 @@ import pandas as pd
 import numpy as np
 import pickle
 import os
+import statsmodels.api as sm
 
 # ============================================================
 # CONFIGURAÇÃO DA PÁGINA
@@ -23,13 +24,14 @@ st.set_page_config(
 st.title("🚗 Calculadora de Prêmio Puro — Seguro Auto")
 st.markdown("""
 Modelo atuarial baseado em dados reais da **SUSEP AUTOSEG (2019-2021)**.  
-Utiliza **GLM Poisson** (frequência) × **GLM Gamma** (severidade) para estimar o prêmio puro de colisão.
+Utiliza **GLM Poisson** (frequência) × **GLM Gamma** (severidade) para estimar o prêmio puro de colisão.  
+Comparação com **XGBoost Tweedie** (Gini = 0.233, Early Stopping round 341).
 """)
 
 st.divider()
 
 # ============================================================
-# REGIÕES
+# REGIÕES E FAIXAS
 # ============================================================
 
 regioes = {
@@ -85,6 +87,34 @@ faixas_etarias = {
 }
 
 # ============================================================
+# CARREGAR MODELOS
+# ============================================================
+
+MODELS_PATH = os.path.join(os.path.dirname(__file__), '..', 'models')
+
+@st.cache_resource
+def load_models():
+    with open(f'{MODELS_PATH}/glm_freq.pkl', 'rb') as f:
+        glm_freq = pickle.load(f)
+    with open(f'{MODELS_PATH}/glm_sev.pkl', 'rb') as f:
+        glm_sev = pickle.load(f)
+    with open(f'{MODELS_PATH}/glm_sev_cols.pkl', 'rb') as f:
+        glm_sev_cols = pickle.load(f)
+    with open(f'{MODELS_PATH}/idade_veiculo_median.pkl', 'rb') as f:
+        idade_median = pickle.load(f)
+    with open(f'{MODELS_PATH}/xgb_freq.pkl', 'rb') as f:
+        xgb_freq = pickle.load(f)
+    return glm_freq, glm_sev, glm_sev_cols, idade_median, xgb_freq
+
+glm_freq, glm_sev, glm_sev_cols, idade_median, xgb_freq = load_models()
+
+# Features base
+features_base = (
+    ['sexo_bin', 'faixa_etaria', 'idade_veiculo', 'log_is_media'] +
+    [f'regiao_{str(i).zfill(2)}' for i in range(2, 42)]
+)
+
+# ============================================================
 # INPUTS
 # ============================================================
 
@@ -92,17 +122,16 @@ col1, col2, col3 = st.columns(3)
 
 with col1:
     st.subheader("👤 Perfil do Condutor")
-    sexo        = st.selectbox("Sexo", ["Masculino", "Feminino"])
-    faixa_label = st.selectbox("Faixa Etária", list(faixas_etarias.keys()))
+    sexo         = st.selectbox("Sexo", ["Masculino", "Feminino"])
+    faixa_label  = st.selectbox("Faixa Etária", list(faixas_etarias.keys()))
     regiao_label = st.selectbox("Região de Circulação", list(regioes.keys()))
 
 with col2:
     st.subheader("🚘 Dados do Veículo")
-    ano_modelo  = st.slider("Ano do Veículo", 1990, 2021, 2018)
-    is_media    = st.number_input("Importância Segurada (R$)", 
-                                   min_value=5_000, max_value=500_000,
-                                   value=50_000, step=5_000,
-                                   format="%d")
+    ano_modelo = st.slider("Ano do Veículo", 1990, 2021, 2018)
+    is_media   = st.number_input("Importância Segurada (R$)",
+                                  min_value=5_000, max_value=500_000,
+                                  value=50_000, step=5_000, format="%d")
 
 with col3:
     st.subheader("📋 Resumo da Apólice")
@@ -113,99 +142,84 @@ with col3:
 st.divider()
 
 # ============================================================
-# CÁLCULO DO PRÊMIO PURO
+# FUNÇÕES DE CÁLCULO
 # ============================================================
 
-# Coeficientes do GLM Poisson (frequência)
-# Extraídos do notebook 03
-coef_freq = {
-    'const':         -9.2306,
-    'sexo_bin':       0.0470,
-    'faixa_etaria':  -0.1321,
-    'idade_veiculo':  0.0195,
-    'log_is_media':   0.4631,
-    'regiao': {
-        '01': 0.0000,  # referência
-        '02': 0.1317, '03': 0.4494, '04': 0.6522, '05': 0.1889,
-        '06': 0.7434, '07': 0.0504, '08': 0.2385, '09': -0.0775,
-        '10': 0.5969, '11': -1.0797, '12': 0.0079, '13': -0.6326,
-        '14': 0.5957, '15': 0.3992, '16': -0.1285, '17': 1.0261,
-        '18': -0.3607, '19': 0.1742, '20': 0.3260, '21': 0.0169,
-        '22': 0.8123, '23': 0.0115, '24': 0.7252, '25': 0.4874,
-        '26': 0.8682, '27': 0.4304, '28': 1.0174, '29': 0.9296,
-        '30': 0.6582, '31': 1.1057, '32': 0.9837, '33': 0.9347,
-        '34': 0.8665, '35': 1.1563, '36': 0.8512, '37': 0.9120,
-        '38': 0.5005, '39': 0.4564, '40': 1.3410, '41': 1.0340,
-    }
-}
+def build_feature_row(sexo, faixa_label, regiao_label, ano_modelo, is_media):
+    sexo_bin   = 1 if sexo == "Masculino" else 0
+    faixa      = faixas_etarias[faixa_label]
+    regiao_cod = regioes[regiao_label]
+    idade_veic = float(np.clip(2021 - ano_modelo, 0, 30))
+    log_is     = float(np.log1p(is_media))
 
-# Coeficientes do GLM Gamma (severidade)
-coef_sev = {
-    'sexo_bin':       0.3684,
-    'faixa_etaria':   0.1513,
-    'idade_veiculo':  0.1075,
-    'log_is_media':   0.6645,
-    'regiao': {
-        '01': 0.0000,  # referência
-        '02': 0.6780, '03': 0.5944, '04': 0.7225, '05': 0.7187,
-        '06': 0.6609, '07': 0.7066, '08': 0.6826, '09': 0.6363,
-        '10': 0.6362, '11': 0.6933, '12': 0.6264, '13': 0.5730,
-        '14': 1.2785, '15': 0.5827, '16': 0.6506, '17': 0.5924,
-        '18': 0.7760, '19': 0.8084, '20': 1.7557, '21': 1.0770,
-        '22': 0.3564, '23': 0.6584, '24': 0.6049, '25': 0.4978,
-        '26': 0.6034, '27': 0.6493, '28': 0.8312, '29': 0.7410,
-        '30': 0.8104, '31': 0.7082, '32': 0.8651, '33': 0.5103,
-        '34': 1.1415, '35': 0.7650, '36': 0.7616, '37': 0.6240,
-        '38': 0.5731, '39': 0.7304, '40': 0.8211, '41': 0.6449,
-    }
-}
+    row = {f: 0.0 for f in features_base}
+    row['sexo_bin']      = sexo_bin
+    row['faixa_etaria']  = faixa
+    row['idade_veiculo'] = idade_veic if not np.isnan(idade_veic) else idade_median
+    row['log_is_media']  = log_is
 
-def calcular_premio(sexo, faixa_label, regiao_label, ano_modelo, is_media):
-    sexo_bin      = 1 if sexo == "Masculino" else 0
-    faixa_etaria  = faixas_etarias[faixa_label]
-    regiao_cod    = regioes[regiao_label]
-    idade_veiculo = np.clip(2021 - ano_modelo, 0, 30)
-    log_is        = np.log1p(is_media)
+    if regiao_cod != '01':
+        col = f'regiao_{regiao_cod}'
+        if col in row:
+            row[col] = 1.0
 
-    # Frequência (Poisson com link log)
-    eta_freq = (
-        coef_freq['const'] +
-        coef_freq['sexo_bin']      * sexo_bin +
-        coef_freq['faixa_etaria']  * faixa_etaria +
-        coef_freq['idade_veiculo'] * idade_veiculo +
-        coef_freq['log_is_media']  * log_is +
-        coef_freq['regiao'].get(regiao_cod, 0)
-    )
-    freq = np.exp(eta_freq)
+    return row, regiao_cod
 
-    # Severidade (Gamma com link log)
-    eta_sev = (
-        coef_sev['sexo_bin']      * sexo_bin +
-        coef_sev['faixa_etaria']  * faixa_etaria +
-        coef_sev['idade_veiculo'] * idade_veiculo +
-        coef_sev['log_is_media']  * log_is +
-        coef_sev['regiao'].get(regiao_cod, 0)
-    )
-    sev = np.exp(eta_sev)
+
+def calcular_glm(sexo, faixa_label, regiao_label, ano_modelo, is_media):
+    row, _ = build_feature_row(sexo, faixa_label, regiao_label, ano_modelo, is_media)
+
+    # Frequência
+    X_freq = pd.DataFrame([row])
+    X_freq = sm.add_constant(X_freq, has_constant='add')
+    offset = np.log(np.array([1.0]))  # exposição = 1 veículo-ano
+    freq = float(glm_freq.predict(X_freq, offset=offset)[0])
+
+    # Severidade
+    X_sev = pd.DataFrame([row])[glm_sev_cols].astype(np.float64)
+    sev = float(glm_sev.predict(X_sev)[0])
 
     return freq, sev, freq * sev
 
+
+def calcular_xgb(sexo, faixa_label, regiao_label, ano_modelo, is_media):
+    row, _ = build_feature_row(sexo, faixa_label, regiao_label, ano_modelo, is_media)
+    X = pd.DataFrame([row])[xgb_freq.feature_names_in_]
+    return float(max(xgb_freq.predict(X)[0], 0))
+
+# ============================================================
+# CÁLCULO
+# ============================================================
+
 if st.button("🧮 Calcular Prêmio Puro", type="primary", use_container_width=True):
-    freq, sev, premio = calcular_premio(
+
+    freq_glm, sev_glm, premio_glm = calcular_glm(
+        sexo, faixa_label, regiao_label, ano_modelo, is_media
+    )
+    freq_xgb = calcular_xgb(
         sexo, faixa_label, regiao_label, ano_modelo, is_media
     )
 
-    st.subheader("📊 Resultado")
+    st.subheader("📊 Resultado — GLM Poisson × Gamma")
     c1, c2, c3 = st.columns(3)
-    c1.metric("Frequência de Sinistro", f"{freq:.4f}", help="Probabilidade de sinistro por veículo-ano")
-    c2.metric("Severidade Média", f"R$ {sev:,.2f}", help="Custo médio por sinistro")
-    c3.metric("💰 Prêmio Puro", f"R$ {premio:,.2f}", help="Frequência × Severidade")
+    c1.metric("Frequência (GLM)", f"{freq_glm:.4f}",
+              help="Probabilidade de sinistro por veículo-ano")
+    c2.metric("Severidade Média (GLM)", f"R$ {sev_glm:,.2f}",
+              help="Custo médio por sinistro")
+    c3.metric("💰 Prêmio Puro (GLM)", f"R$ {premio_glm:,.2f}",
+              help="Frequência × Severidade")
+
+    st.subheader("📊 Resultado — XGBoost Tweedie (Gini = 0.233)")
+    c4, c5 = st.columns(2)
+    c4.metric("Frequência (XGBoost)", f"{freq_xgb:.4f}")
+    c5.metric("Diferença vs GLM", f"{(freq_xgb - freq_glm):+.4f}")
 
     st.info(f"""
-    **Interpretação:** Para um veículo com este perfil, espera-se **{freq:.2%}** de chance 
-    de sinistro de colisão por ano, com custo médio de **R$ {sev:,.2f}** por ocorrência.  
-    O prêmio puro estimado é de **R$ {premio:,.2f}** por veículo-ano.
+    **Interpretação:** Para este perfil, o GLM estima **{freq_glm:.2%}** de chance de sinistro 
+    por ano, com custo médio de **R$ {sev_glm:,.2f}** por ocorrência.  
+    O prêmio puro estimado é de **R$ {premio_glm:,.2f}** por veículo-ano.  
+    O XGBoost estima frequência de **{freq_xgb:.2%}**.
     """)
 
 st.divider()
-st.caption("Fonte: SUSEP AUTOSEG 2019-2021 | Modelo: GLM Poisson × Gamma | Autor: Arthur Pontes Motta")
+st.caption("Fonte: SUSEP AUTOSEG 2019-2021 | GLM Poisson × Gamma | XGBoost Tweedie (Gini=0.233) | Autor: Arthur Pontes Motta")
