@@ -134,8 +134,11 @@ The project compares the modeled pure premium against SUSEP's reported market pr
 ### Gini & Lift Chart — Collision (0.241) and Theft (0.402)
 ![Gini](reports/figures/04_gini_lift.png)
 
-### SHAP — Collision vs Theft Feature Importance
+### SHAP — Collision Feature Importance
 ![SHAP Collision](reports/figures/04_shap_summary_col.png)
+
+### SHAP — Theft Feature Importance
+![SHAP Theft](reports/figures/04_shap_summary_rou.png)
 
 ### Market Analysis — Loss Ratio by Region
 ![Market](reports/figures/05_market_analysis_regional.png)
