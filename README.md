@@ -12,15 +12,15 @@
 
 ## 📌 Overview
 
-This project builds an end-to-end auto insurance pricing model using **12.6 million policy records** from Brazil's insurance regulator (SUSEP). It combines classical actuarial methods (GLM) with modern machine learning (XGBoost + SHAP) and deploys an interactive pricing calculator via Streamlit.
+This project builds an end-to-end auto insurance pricing model using **12.6 million policy records** from Brazil's insurance regulator (SUSEP). It combines classical actuarial methods (GLM) with modern machine learning (XGBoost + SHAP), models **collision and theft separately**, and deploys an interactive pricing calculator via Streamlit.
 
 ---
 
 ## 🎯 Business Problem
 
-How should an insurer price auto collision coverage given the policyholder's profile (age, gender, region) and vehicle characteristics (model year, insured value)?
+How should an insurer price auto insurance (collision + theft) given the policyholder's profile (age, gender, region) and vehicle characteristics (model year, insured value)?
 
-The standard actuarial approach — and the regulatory expectation in Brazil — is to separate the pricing problem into two components: **how often** claims occur (frequency) and **how costly** they are when they do (severity). The pure premium is then their product.
+The standard actuarial approach — and the regulatory expectation in Brazil — is to separate the pricing problem into two components: **how often** claims occur (frequency) and **how costly** they are when they do (severity). The pure premium is then their product. This project models **collision and theft as separate risks**, reflecting their different risk drivers.
 
 ---
 
@@ -41,82 +41,104 @@ See [`data/raw/README.md`](data/raw/README.md) for download instructions.
 
 ## 🔬 Methodology & Theoretical Justifications
 
-### 1. Temporal Train/Test Split
-Data is split temporally: **train = 2019–2020**, **test = 2021**. A random split would leak future information into the training set, violating the causal structure of insurance pricing — models must be built on past data and validated on future periods.
+### 1. Separate Models per Coverage
+Collision and theft are modeled independently. The correlation between their frequencies is **0.021** — effectively zero — meaning their risk drivers are distinct. Regions with high collision frequency do not necessarily have high theft frequency (e.g. Mato Grosso has high collision but average theft; Rio de Janeiro metro has high theft but average collision). A joint model would average out these differences.
 
-### 2. GLM Poisson — Claim Frequency
-- **Why Poisson?** Claim counts follow a Poisson process: events are rare, independent, and occur at a constant rate per unit of exposure. This is the standard actuarial assumption for frequency modeling (Ohlsson & Johansson, 2010).
-- **Why a log offset for exposure?** Policyholders have different exposure periods (vehicle-years). The offset log(exposure) normalizes the prediction to a per-vehicle-year rate, which is the correct actuarial target.
-- **Why 500k sample?** statsmodels requires the full design matrix in memory. At 6.5M rows × 44 features, this causes MemoryError. A stratified sample of 500k is sufficient for stable GLM estimation — the asymptotic properties of MLE hold well above ~50k observations.
-- **Outlier threshold at p99:** The top 1% of freq_colisao_rel contains data entry errors and extreme micro-exposures. Removing them prevents the GLM from fitting to artifacts rather than signal.
+### 2. Temporal Train/Test Split
+Data is split temporally: **train = 2019–2020**, **test = 2021**. A random split would leak future information into the training set, violating the causal structure of insurance pricing.
 
-### 3. GLM Gamma — Claim Severity
-- **Why Gamma?** Claim costs are strictly positive and right-skewed — the Gamma distribution is the canonical actuarial choice for severity (McCullagh & Nelder, 1989). It assumes variance proportional to the mean squared, which matches empirical insurance severity distributions better than Gaussian or Log-Normal.
-- **Why clip at p99?** The Gamma family requires y > 0 and is sensitive to extreme values. Clipping at p99 removes catastrophic outliers that should be handled by excess-of-loss reinsurance rather than the primary pricing model.
-- **Why start_params + Newton?** With 40 regional dummies, near-multicollinearity slows convergence. Initializing with intercept = log(mean(y)) and using Newton's method (second-order) ensures stable convergence in fewer iterations.
+### 3. GLM Poisson — Claim Frequency
+- **Why Poisson?** Claim counts follow a Poisson process: rare, independent events at a constant rate per unit of exposure (Ohlsson & Johansson, 2010).
+- **Why log offset?** Normalizes predictions to a per-vehicle-year rate regardless of exposure period.
+- **Why 500k sample?** Sufficient for stable MLE (asymptotic properties hold above ~50k), avoids MemoryError with 6.5M × 44 features.
+- **Outlier threshold at p99:** Removes data entry errors and micro-exposures without discarding legitimate extreme events.
 
-### 4. Pure Premium
+### 4. GLM Gamma — Claim Severity
+- **Why Gamma?** Strictly positive, right-skewed — the canonical actuarial choice for severity (McCullagh & Nelder, 1989).
+- **Why clip at p99?** Removes catastrophic outliers handled by reinsurance rather than primary pricing.
+- **Why start_params + Newton?** Near-multicollinearity from 40 regional dummies slows convergence; initializing with log(mean(y)) and Newton's method ensures stability.
+
+### 5. Pure Premium
 ```
 Pure Premium = Frequency × Severity
 ```
-This two-component structure (frequency-severity, or freq-sev) is the industry standard for P&C pricing. It allows separate rating factors for each component and is required for regulatory filings in Brazil.
+Applied separately for collision and theft, then summed:
+```
+PP_total = PP_collision + PP_theft
+```
 
-### 5. XGBoost with Tweedie Objective
-- **Why Tweedie?** The pure premium distribution has a point mass at zero (no claim) and a continuous right tail (claim amount). The Tweedie distribution (variance power = 1.5) naturally handles this mixed discrete-continuous structure without requiring the freq-sev decomposition.
-- **Why variance_power = 1.5?** Values between 1 and 2 define the Tweedie family. Power = 1.5 (compound Poisson-Gamma) is the standard choice for insurance data, balancing the Poisson (frequency) and Gamma (severity) components.
-- **Why early stopping?** Running 1000 trees without validation wastes compute and risks overfitting. Early stopping on a 10% validation hold-out stopped at round 341, confirming the model generalizes well.
-- **Why L1 + L2 regularization?** With 40+ sparse regional dummies, unregularized trees can overfit to rare region-specific patterns. reg_alpha=0.1 (L1) and reg_lambda=1.0 (L2) penalize complexity.
-- **Why min_child_weight=10?** Prevents leaf nodes with fewer than 10 weighted observations — critical for sparse data where 90.6% of records have zero claims.
+### 6. XGBoost with Tweedie Objective
+- **Why Tweedie?** Handles the mixed discrete-continuous structure (point mass at zero + continuous tail) without requiring the freq-sev decomposition.
+- **Why variance_power = 1.5?** Standard choice for insurance data (compound Poisson-Gamma).
+- **Why early stopping?** Stopped at round 274 (collision) and 65 (theft), confirming good generalization.
+- **Why L1 + L2 regularization?** Prevents overfitting to rare region-specific patterns with 40+ sparse dummies.
+- **Why min_child_weight=10?** Prevents leaf nodes with too few observations — critical with 90%+ zero claims.
 
-### 6. SHAP Explainability
-- **Why SHAP?** SUSEP requires actuarial models to be interpretable and auditable. SHAP (SHapley Additive exPlanations) provides theoretically grounded, consistent feature attributions based on cooperative game theory (Lundberg & Lee, 2017). Unlike permutation importance, SHAP values are additive and respect feature interactions.
+### 7. SHAP Explainability
+SHAP provides theoretically grounded feature attributions based on cooperative game theory (Lundberg & Lee, 2017). Key insight: **theft and collision have different top features** — `log_is_media` dominates theft (non-linearly: mid-value vehicles stolen most) while `idade_veiculo` dominates collision (newer vehicles crash more).
+
+### 8. Market Premium Analysis
+The project compares the modeled pure premium against SUSEP's reported market premium (`PREMIO1`), calculating an implicit loss ratio by region and profile. This reveals relative over/underpricing across the market — not in absolute terms (market premium includes loadings, expenses, profit) but in relative adequacy across segments.
 
 ---
 
 ## 📈 Results
 
-| Metric | GLM Poisson | XGBoost |
-|--------|-------------|---------|
-| MAE | 0.0571 | 0.0530 |
-| Correlation | 0.0408 | 0.0851 |
-| Gini | — | **0.233** |
-| Best iteration | — | 341 / 1000 |
+### GLM vs XGBoost
 
-**Gini = 0.233** is within the typical range of 0.20–0.35 for auto insurance frequency models reported in the actuarial literature.
+| Metric | GLM — Collision | XGBoost — Collision | GLM — Theft | XGBoost — Theft |
+|--------|----------------|---------------------|-------------|-----------------|
+| MAE | 0.0571 | **0.0513** | 0.0138 | **0.0057** |
+| Correlation | 0.0356 | **0.0854** | 0.1066 | **0.1215** |
+| Gini | — | **0.241** | — | **0.402** |
+| Best iteration | — | 274 / 1000 | — | 65 / 1000 |
+
+**Gini = 0.402 for theft** is exceptionally strong — theft has a much clearer regional pattern than collision, making it more predictable.
 
 ### Key Findings
-- **COVID-19:** Collision frequency dropped ~25% in 2020-S1 due to lockdowns, recovering in 2021
-- **Age effect:** Each older age band reduces collision frequency by ~13% (GLM coef: -0.132)
-- **Gender:** Male drivers show ~4.8% higher collision frequency (GLM coef: +0.047)
-- **Regional risk:** Tocantins (region 40) has the highest frequency; São Paulo metro (region 11) the lowest
-- **Vehicle value:** Higher insured amounts correlate with both higher frequency and higher severity (SHAP: log_is_media is the 2nd most important feature)
-- **Vehicle age:** Older vehicles have higher frequency but this effect is moderated by insured value (SHAP dependence plot)
+- **COVID-19:** Collision frequency dropped ~25% in 2020-S2 due to lockdowns, recovering in 2021. Theft showed a spike in 2021-S1.
+- **Gender:** Male drivers show 6.4% higher collision frequency and **40.5% higher theft frequency** (GLM coefficients).
+- **Vehicle value:** Higher IS correlates with higher collision frequency but lower theft frequency — expensive vehicles likely have trackers and private garages.
+- **Regional theft:** Rio de Janeiro metro has 3× the theft frequency of the lowest-risk regions (SHAP: regiao_18 is the strongest regional signal for theft).
+- **Market adequacy:** Loss ratio ranges from 27% (Amapá — market overprices) to 89% (Espírito Santo — market underprices), for collision + theft combined.
+- **Age paradox:** 18-25 year olds have LR=21% — the market charges a large premium for young drivers but the data suggests they are relatively overcautious post-COVID.
+
+### Pure Premium Summary
+| Coverage | Avg Pure Premium | Share |
+|----------|-----------------|-------|
+| Collision | R$ 645.88 | 90.0% |
+| Theft | R$ 71.46 | 10.0% |
+| **Total (col + theft)** | **R$ 717.35** | 100% |
 
 ---
 
 ## ⚠️ Limitations
 
-- **Sampling:** GLM trained on 500k of 6.5M records. Full-dataset training (via `glum` or `sklearn`) could improve coefficient precision marginally but is unlikely to change conclusions given sample size.
-- **No overdispersion test:** Negative Binomial was not tested as an alternative to Poisson. The Poisson assumption of equidispersion may be violated; future work should test with `sm.NegativeBinomial`.
-- **Single coverage:** Only collision (`colisao`) is modeled. SUSEP AUTOSEG contains additional coverages (theft, fire, third-party liability) that would require separate models.
-- **No temporal validation:** Beyond the train/test split, no rolling-window or walk-forward validation was performed.
-- **Streamlit app loads pickle files locally:** The deployed app requires the `models/` directory with trained pickles. These are not versioned due to file size.
+- **Fire excluded from modeling:** Fire coverage represents 1.3% of pure premium but showed 100% zeros in training data at the grupamento level — insufficient credibility for GLM. Priced via market tables in practice.
+- **"Other coverages" excluded:** Assistance, glass, accessories represent 10.9% of pure premium but are heterogeneous — the AUTOSEG does not disaggregate by claim type.
+- **Sampling:** GLM trained on 500k of 6.5M records.
+- **No overdispersion test:** Negative Binomial not tested as alternative to Poisson.
+- **Market premium is commercial:** Includes loadings, expenses and profit margin — loss ratio comparison is indicative of relative adequacy, not absolute.
+- **Streamlit requires local pickle files:** Models versioned via Git LFS.
 
 ---
 
 ## 📸 Screenshots
 
-### EDA — SUSEP AUTOSEG (2019–2021)
-![EDA](reports/figures/01_eda_overview.png)
+### EDA — Multi-Coverage Analysis
+![EDA](reports/figures/01_eda_multicob.png)
 
-### GLM Evaluation — Observed vs Predicted
+### GLM Evaluation — Collision and Theft
 ![GLM](reports/figures/03_glm_avaliacao.png)
 
-### XGBoost — SHAP Feature Importance
-![SHAP](reports/figures/04_shap_summary.png)
-
-### Gini Curve & Lift Chart
+### Gini & Lift Chart — Collision (0.241) and Theft (0.402)
 ![Gini](reports/figures/04_gini_lift.png)
+
+### SHAP — Collision vs Theft Feature Importance
+![SHAP Collision](reports/figures/04_shap_summary_col.png)
+
+### Market Analysis — Loss Ratio by Region
+![Market](reports/figures/05_market_analysis_regional.png)
 
 ---
 
@@ -127,18 +149,19 @@ insurance-pricing-susep/
 │   ├── raw/                          # SUSEP AUTOSEG files (not versioned)
 │   │   └── README.md                 # Download instructions
 │   └── processed/                    # Parquet files (not versioned)
-├── models/                           # Trained pickles (not versioned)
+├── models/                           # Trained pickles via Git LFS
 ├── notebooks/
-│   ├── 01_eda.ipynb                  # Exploratory Data Analysis
-│   ├── 02_feature_engineering.ipynb  # Feature Engineering
-│   ├── 03_glm_modeling.ipynb         # GLM Poisson + Gamma
-│   └── 04_ml_comparison.ipynb        # XGBoost + SHAP + Gini
+│   ├── 01_eda.ipynb                  # EDA multi-coverage + market premium
+│   ├── 02_feature_engineering.ipynb  # Feature engineering
+│   ├── 03_glm_modeling.ipynb         # GLM Poisson + Gamma (collision + theft)
+│   ├── 04_ml_comparison.ipynb        # XGBoost + SHAP + Gini (collision + theft)
+│   └── 05_market_analysis.ipynb      # Market premium vs pure premium
 ├── app/
 │   └── streamlit_app.py              # Interactive pricing calculator
 ├── reports/figures/                  # Generated visualizations
 ├── src/
-│   ├── data_loader.py                # Data loading utilities
-│   ├── preprocessing.py              # Cleaning and feature engineering
+│   ├── data_loader.py
+│   ├── preprocessing.py
 │   └── modeling.py                   # GLM, XGBoost, Gini, Lift Chart
 ├── requirements.txt
 └── README.md
@@ -156,7 +179,7 @@ source venv/bin/activate    # Linux/Mac
 pip install -r requirements.txt
 
 # Download SUSEP data (see data/raw/README.md)
-# Run notebooks 01 → 02 → 03 → 04 in order
+# Run notebooks 01 → 02 → 03 → 04 → 05 in order
 jupyter notebook
 
 # Run Streamlit app
@@ -169,7 +192,9 @@ streamlit run app/streamlit_app.py
 
 **Arthur Pontes Motta**  
 Statistics & Actuarial Science — UFRJ  
-[GitHub](https://github.com/arthurpmotta02) · [LinkedIn](https://linkedin.com/in/arthurpmotta)
+
+[![GitHub](https://img.shields.io/badge/GitHub-arthurpmotta02-181717?logo=github&logoColor=white)](https://github.com/arthurpmotta02)
+[![LinkedIn](https://img.shields.io/badge/LinkedIn-arthurpmotta-0A66C2?logo=linkedin&logoColor=white)](https://linkedin.com/in/arthurpmotta)
 
 ---
 

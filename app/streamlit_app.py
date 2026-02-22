@@ -11,10 +11,6 @@ import pickle
 import os
 import statsmodels.api as sm
 
-# ============================================================
-# CONFIGURAÇÃO DA PÁGINA
-# ============================================================
-
 st.set_page_config(
     page_title="Precificação de Seguro Auto",
     page_icon="🚗",
@@ -24,8 +20,8 @@ st.set_page_config(
 st.title("🚗 Calculadora de Prêmio Puro — Seguro Auto")
 st.markdown("""
 Modelo atuarial baseado em dados reais da **SUSEP AUTOSEG (2019-2021)**.  
-Utiliza **GLM Poisson** (frequência) × **GLM Gamma** (severidade) para estimar o prêmio puro de colisão.  
-Comparação com **XGBoost Tweedie** (Gini = 0.233, Early Stopping round 341).
+Utiliza **GLM Poisson × Gamma** para frequência e severidade de **colisão e roubo** separadamente.  
+Comparação com **XGBoost Tweedie** (Gini Colisão = 0.241 | Gini Roubo = 0.402).
 """)
 
 st.divider()
@@ -94,21 +90,25 @@ MODELS_PATH = os.path.join(os.path.dirname(__file__), '..', 'models')
 
 @st.cache_resource
 def load_models():
-    with open(f'{MODELS_PATH}/glm_freq.pkl', 'rb') as f:
-        glm_freq = pickle.load(f)
-    with open(f'{MODELS_PATH}/glm_sev.pkl', 'rb') as f:
-        glm_sev = pickle.load(f)
-    with open(f'{MODELS_PATH}/glm_sev_cols.pkl', 'rb') as f:
-        glm_sev_cols = pickle.load(f)
-    with open(f'{MODELS_PATH}/idade_veiculo_median.pkl', 'rb') as f:
-        idade_median = pickle.load(f)
-    with open(f'{MODELS_PATH}/xgb_freq.pkl', 'rb') as f:
-        xgb_freq = pickle.load(f)
-    return glm_freq, glm_sev, glm_sev_cols, idade_median, xgb_freq
+    def load(name):
+        with open(f'{MODELS_PATH}/{name}', 'rb') as f:
+            return pickle.load(f)
 
-glm_freq, glm_sev, glm_sev_cols, idade_median, xgb_freq = load_models()
+    return {
+        'glm_freq_col':     load('glm_freq_col.pkl'),
+        'glm_sev_col':      load('glm_sev_col.pkl'),
+        'glm_sev_col_cols': load('glm_sev_col_cols.pkl'),
+        'glm_freq_rou':     load('glm_freq_rou.pkl'),
+        'glm_sev_rou':      load('glm_sev_rou.pkl'),
+        'glm_sev_rou_cols': load('glm_sev_rou_cols.pkl'),
+        'xgb_col':          load('xgb_col.pkl'),
+        'xgb_rou':          load('xgb_rou.pkl'),
+        'idade_median':     load('idade_veiculo_median.pkl'),
+        'meta':             load('model_meta.pkl'),
+    }
 
-# Features base
+models = load_models()
+
 features_base = (
     ['sexo_bin', 'faixa_etaria', 'idade_veiculo', 'log_is_media'] +
     [f'regiao_{str(i).zfill(2)}' for i in range(2, 42)]
@@ -134,10 +134,11 @@ with col2:
                                   value=50_000, step=5_000, format="%d")
 
 with col3:
-    st.subheader("📋 Resumo da Apólice")
+    st.subheader("📋 Resumo")
     st.metric("Sexo", sexo)
     st.metric("Faixa Etária", faixa_label)
     st.metric("IS", f"R$ {is_media:,.0f}")
+    st.metric("Idade do Veículo", f"{2021 - ano_modelo} anos")
 
 st.divider()
 
@@ -145,47 +146,31 @@ st.divider()
 # FUNÇÕES DE CÁLCULO
 # ============================================================
 
-def build_feature_row(sexo, faixa_label, regiao_label, ano_modelo, is_media):
-    sexo_bin   = 1 if sexo == "Masculino" else 0
-    faixa      = faixas_etarias[faixa_label]
-    regiao_cod = regioes[regiao_label]
-    idade_veic = float(np.clip(2021 - ano_modelo, 0, 30))
-    log_is     = float(np.log1p(is_media))
-
+def build_row(sexo, faixa_label, regiao_label, ano_modelo, is_media):
     row = {f: 0.0 for f in features_base}
-    row['sexo_bin']      = sexo_bin
-    row['faixa_etaria']  = faixa
-    row['idade_veiculo'] = idade_veic if not np.isnan(idade_veic) else idade_median
-    row['log_is_media']  = log_is
-
+    row['sexo_bin']      = 1.0 if sexo == "Masculino" else 0.0
+    row['faixa_etaria']  = float(faixas_etarias[faixa_label])
+    row['idade_veiculo'] = float(np.clip(2021 - ano_modelo, 0, 30))
+    row['log_is_media']  = float(np.log1p(is_media))
+    regiao_cod = regioes[regiao_label]
     if regiao_cod != '01':
         col = f'regiao_{regiao_cod}'
         if col in row:
             row[col] = 1.0
+    return row
 
-    return row, regiao_cod
+def calcular_glm_cobertura(row, glm_freq, glm_sev, sev_cols):
+    X_freq = sm.add_constant(pd.DataFrame([row]), has_constant='add')
+    offset = np.log(np.array([1.0]))
+    freq   = float(glm_freq.predict(X_freq, offset=offset)[0])
 
-
-def calcular_glm(sexo, faixa_label, regiao_label, ano_modelo, is_media):
-    row, _ = build_feature_row(sexo, faixa_label, regiao_label, ano_modelo, is_media)
-
-    # Frequência
-    X_freq = pd.DataFrame([row])
-    X_freq = sm.add_constant(X_freq, has_constant='add')
-    offset = np.log(np.array([1.0]))  # exposição = 1 veículo-ano
-    freq = float(glm_freq.predict(X_freq, offset=offset)[0])
-
-    # Severidade
-    X_sev = pd.DataFrame([row])[glm_sev_cols].astype(np.float64)
-    sev = float(glm_sev.predict(X_sev)[0])
-
+    X_sev = pd.DataFrame([row])[sev_cols].astype(np.float64)
+    sev   = float(glm_sev.predict(X_sev)[0])
     return freq, sev, freq * sev
 
-
-def calcular_xgb(sexo, faixa_label, regiao_label, ano_modelo, is_media):
-    row, _ = build_feature_row(sexo, faixa_label, regiao_label, ano_modelo, is_media)
-    X = pd.DataFrame([row])[xgb_freq.feature_names_in_]
-    return float(max(xgb_freq.predict(X)[0], 0))
+def calcular_xgb_cobertura(row, xgb_model):
+    X = pd.DataFrame([row])[xgb_model.feature_names_in_]
+    return float(max(xgb_model.predict(X)[0], 0))
 
 # ============================================================
 # CÁLCULO
@@ -193,33 +178,81 @@ def calcular_xgb(sexo, faixa_label, regiao_label, ano_modelo, is_media):
 
 if st.button("🧮 Calcular Prêmio Puro", type="primary", use_container_width=True):
 
-    freq_glm, sev_glm, premio_glm = calcular_glm(
-        sexo, faixa_label, regiao_label, ano_modelo, is_media
-    )
-    freq_xgb = calcular_xgb(
-        sexo, faixa_label, regiao_label, ano_modelo, is_media
+    row = build_row(sexo, faixa_label, regiao_label, ano_modelo, is_media)
+
+    # GLM — Colisão
+    freq_col, sev_col, pp_col = calcular_glm_cobertura(
+        row,
+        models['glm_freq_col'],
+        models['glm_sev_col'],
+        models['glm_sev_col_cols']
     )
 
-    st.subheader("📊 Resultado — GLM Poisson × Gamma")
+    # GLM — Roubo
+    freq_rou, sev_rou, pp_rou = calcular_glm_cobertura(
+        row,
+        models['glm_freq_rou'],
+        models['glm_sev_rou'],
+        models['glm_sev_rou_cols']
+    )
+
+    # XGBoost
+    xgb_col_pred = calcular_xgb_cobertura(row, models['xgb_col'])
+    xgb_rou_pred = calcular_xgb_cobertura(row, models['xgb_rou'])
+
+    pp_total_glm = pp_col + pp_rou
+    pp_total_xgb = xgb_col_pred * sev_col + xgb_rou_pred * sev_rou
+
+    # ============================================================
+    # RESULTADOS
+    # ============================================================
+
+    st.subheader("📊 Prêmio Puro por Cobertura — GLM")
+
     c1, c2, c3 = st.columns(3)
-    c1.metric("Frequência (GLM)", f"{freq_glm:.4f}",
+    c1.metric("Freq. Colisão", f"{freq_col:.4f}",
               help="Probabilidade de sinistro por veículo-ano")
-    c2.metric("Severidade Média (GLM)", f"R$ {sev_glm:,.2f}",
-              help="Custo médio por sinistro")
-    c3.metric("💰 Prêmio Puro (GLM)", f"R$ {premio_glm:,.2f}",
-              help="Frequência × Severidade")
+    c2.metric("Severidade Colisão", f"R$ {sev_col:,.2f}",
+              help="Custo médio por sinistro de colisão")
+    c3.metric("💰 PP Colisão (GLM)", f"R$ {pp_col:,.2f}")
 
-    st.subheader("📊 Resultado — XGBoost Tweedie (Gini = 0.233)")
-    c4, c5 = st.columns(2)
-    c4.metric("Frequência (XGBoost)", f"{freq_xgb:.4f}")
-    c5.metric("Diferença vs GLM", f"{(freq_xgb - freq_glm):+.4f}")
+    c4, c5, c6 = st.columns(3)
+    c4.metric("Freq. Roubo", f"{freq_rou:.4f}",
+              help="Probabilidade de roubo por veículo-ano")
+    c5.metric("Severidade Roubo", f"R$ {sev_rou:,.2f}",
+              help="Custo médio por sinistro de roubo")
+    c6.metric("💰 PP Roubo (GLM)", f"R$ {pp_rou:,.2f}")
+
+    st.divider()
+    st.subheader("📊 Comparação GLM vs XGBoost")
+
+    c7, c8, c9 = st.columns(3)
+    c7.metric("PP Total GLM", f"R$ {pp_total_glm:,.2f}",
+              help="Colisão + Roubo")
+    c8.metric("PP Total XGBoost", f"R$ {pp_total_xgb:,.2f}",
+              help="Usando freq XGBoost × sev GLM")
+    c9.metric("Diferença", f"R$ {(pp_total_xgb - pp_total_glm):+,.2f}")
+
+    st.divider()
+    st.subheader("📊 XGBoost — Frequências")
+
+    c10, c11 = st.columns(2)
+    c10.metric("Freq. Colisão (XGBoost)",  f"{xgb_col_pred:.4f}",
+               delta=f"{(xgb_col_pred - freq_col):+.4f} vs GLM")
+    c11.metric("Freq. Roubo (XGBoost)", f"{xgb_rou_pred:.4f}",
+               delta=f"{(xgb_rou_pred - freq_rou):+.4f} vs GLM")
 
     st.info(f"""
-    **Interpretação:** Para este perfil, o GLM estima **{freq_glm:.2%}** de chance de sinistro 
-    por ano, com custo médio de **R$ {sev_glm:,.2f}** por ocorrência.  
-    O prêmio puro estimado é de **R$ {premio_glm:,.2f}** por veículo-ano.  
-    O XGBoost estima frequência de **{freq_xgb:.2%}**.
+    **Interpretação:** Para este perfil, o GLM estima **{freq_col:.2%}** de chance de colisão 
+    e **{freq_rou:.2%}** de chance de roubo por ano.  
+    Custos médios: colisão **R$ {sev_col:,.2f}** | roubo **R$ {sev_rou:,.2f}**.  
+    **Prêmio puro total (GLM): R$ {pp_total_glm:,.2f} por veículo-ano.**
     """)
 
 st.divider()
-st.caption("Fonte: SUSEP AUTOSEG 2019-2021 | GLM Poisson × Gamma | XGBoost Tweedie (Gini=0.233) | Autor: Arthur Pontes Motta")
+st.caption(
+    "Fonte: SUSEP AUTOSEG 2019-2021 | "
+    "GLM Poisson × Gamma | "
+    "XGBoost Tweedie (Gini Colisão=0.241 | Gini Roubo=0.402) | "
+    "Autor: Arthur Pontes Motta"
+)
