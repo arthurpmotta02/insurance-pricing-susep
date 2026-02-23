@@ -125,14 +125,26 @@ The project compares the modeled pure premium against SUSEP's reported market pr
 
 ## 📸 Screenshots
 
-### EDA — Multi-Coverage Analysis
-![EDA](reports/figures/01_eda_multicob.png)
+### EDA — Overview
+![EDA Overview](reports/figures/01_eda_overview.png)
+
+### EDA — Multi-Coverage Analysis (Collision, Theft, Fire)
+![EDA Multi-Coverage](reports/figures/01_eda_multicob.png)
+
+### EDA — Regional Analysis
+![EDA Regional](reports/figures/01_eda_regional.png)
+
+### EDA — Coverage Correlations
+![EDA Correlations](reports/figures/01_eda_correlacoes.png)
+
+### Feature Engineering — Response Variable Distributions
+![Feature Engineering](reports/figures/02_feature_engineering.png)
 
 ### GLM Evaluation — Collision and Theft
-![GLM](reports/figures/03_glm_avaliacao.png)
+![GLM Evaluation](reports/figures/03_glm_avaliacao.png)
 
 ### Gini & Lift Chart — Collision (0.241) and Theft (0.402)
-![Gini](reports/figures/04_gini_lift.png)
+![Gini & Lift](reports/figures/04_gini_lift.png)
 
 ### SHAP — Collision Feature Importance
 ![SHAP Collision](reports/figures/04_shap_summary_col.png)
@@ -140,8 +152,17 @@ The project compares the modeled pure premium against SUSEP's reported market pr
 ### SHAP — Theft Feature Importance
 ![SHAP Theft](reports/figures/04_shap_summary_rou.png)
 
+### SHAP Dependence — Collision
+![SHAP Dependence Collision](reports/figures/04_shap_dependence_col.png)
+
+### SHAP Dependence — Theft
+![SHAP Dependence Theft](reports/figures/04_shap_dependence_rou.png)
+
 ### Market Analysis — Loss Ratio by Region
-![Market](reports/figures/05_market_analysis_regional.png)
+![Market Regional](reports/figures/05_market_analysis_regional.png)
+
+### Market Analysis — Loss Ratio by Profile
+![Market Profile](reports/figures/05_market_analysis_perfil.png)
 
 ---
 
